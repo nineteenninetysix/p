@@ -183,7 +183,7 @@ metadata:
 provisioner: nfs.csi.k8s.io
 parameters:
   server: <kube-vip>
-  share: /nfs            # confirm the export name first: showmount -e 10.40.40.220
+  share: /nfs            # confirm the export name first: showmount -e <nfs-ip>
 reclaimPolicy: Retain        # keep data on PVC delete; safer for a backup target
 volumeBindingMode: Immediate
 mountOptions:
@@ -304,7 +304,7 @@ helm install monitoring prometheus-community/kube-prometheus-stack \
 kubectl -n monitoring get secret monitoring-grafana \
   -o jsonpath='{.data.admin-password}' | base64 -d; echo
 
-curl --cacert lab-root-ca.crt --resolve grafana.apps.mreja:443:<ingress-ip> \
+curl --cacert lab-root-ca.crt --resolve grafana.apps.example.com:443:<ingress-ip> \
   https://grafana.apps.example.com/api/health    # expect {"database":"ok",...}
 
 
@@ -383,7 +383,7 @@ metadata:
   annotations: { argocd.argoproj.io/sync-wave: "1" }
 
 Container Registry — enabled on the GitLab instance (GitLab 19.0.2 EE) and on the projecta project. Endpoint is <gitlab>:5050 over plain HTTP. Probe it with curl -I http://<gitlab>:5050/v2/ (expect 401 = registry alive).
-A GitLab Runner — installed on the GitLab server itself (apt install gitlab-runner, Ubuntu 24.04), docker executor, gitlab-runner user added to the docker group. GitLab 19 removed the registration-token flow: create the runner in the UI (project → Settings → CI/CD → Runners → New project runner, tick "Run untagged jobs") to mint a glrt-… authentication token, then gitlab-runner register --non-interactive --url http://10.40.40.230 --token glrt-… --executor docker --docker-image alpine:latest.
+A GitLab Runner — installed on the GitLab server itself (apt install gitlab-runner, Ubuntu 24.04), docker executor, gitlab-runner user added to the docker group. GitLab 19 removed the registration-token flow: create the runner in the UI (project → Settings → CI/CD → Runners → New project runner, tick "Run untagged jobs") to mint a glrt-… authentication token, then gitlab-runner register --non-interactive --url http://<gitlab> --token glrt-… --executor docker --docker-image alpine:latest.
 Node trust for the HTTP registry — containerd refuses plain-HTTP registries by default. On every node, write /etc/rancher/k3s/registries.yaml:
 
 mirrors:
@@ -468,7 +468,7 @@ metadata:
 spec:
   secretName: es-http-cert            # ECK consumes this via spec.http.tls.certificate
   dnsNames:
-    - elasticsearch.apps.mreja        # external hostname (lab: no live DNS)
+    - elasticsearch.apps.example.com        # external hostname (lab: no live DNS)
     # In-cluster service names: REQUIRED when replacing ECK's self-signed cert,
     # or in-cluster clients (e.g. Prometheus exporter) fail TLS verification.
     - logging-es-http
