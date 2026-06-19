@@ -1,0 +1,640 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+HOSTNAME_FQDN="${1:?usage: bootstrap.sh <hostname>}"
+
+# packages
+apt-get update && apt-get -y upgrade
+apt-get install -y nfs-common curl apt-transport-https ca-certificates open-iscsi
+
+# hostname
+hostnamectl set-hostname "${HOSTNAME_FQDN%%.*}"
+
+# time
+# systemctl enable --now chrony
+
+# local dns
+# add relevant entries to /etc/hosts for k3s nodes and nfs
+
+# swap
+swapoff -a
+sed -i.bak '/\sswap\s/s/^/#/' /etc/fstab
+
+# modules
+printf 'overlay\nbr_netfilter\n' > /etc/modules-load.d/k8s.conf
+modprobe overlay; modprobe br_netfilter
+
+# sysctls
+cat <<'EOF' | tee /etc/sysctl.d/99-k8s.conf
+# --- Kubernetes networking ---
+net.bridge.bridge-nf-call-iptables  = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward                 = 1
+
+# --- Elasticsearch (required on any node that may run ES pods) ---
+vm.max_map_count = 262144
+
+# --- Many pods / watches (ES, Prometheus, operators) ---
+fs.inotify.max_user_instances = 8192
+fs.inotify.max_user_watches   = 524288
+EOF
+
+sysctl --system
+
+# firewall
+ufw allow from <k3s-subnet> to any port 6443 proto tcp comment 'Kubernetes API'
+ufw allow from <k3s-subnet> to any port 2379:2380 proto tcp comment 'etcd server-to-server traffic'
+ufw allow from <k3s-subnet> to any port 10250 proto tcp comment 'kubelet metrics'
+ufw allow from <k3s-subnet> to any port 8472 proto udp comment 'Flannel VXLAN (prod)'
+ufw allow from <k3s-subnet> to any port 7946 comment 'MetalLB speaker - udp/tcp'
+ufw allow from <k3s-subnet> to any port 9200 proto tcp comment 'Elasticsearch API'
+
+# 8. verify NFS
+showmount -e nfs.example.com || { echo "NFS not reachable"; exit 1; }
+
+echo "Base OS prep complete for ${HOSTNAME_FQDN}."
+
+
+---
+
+export INSTALL_K3S_VERSION="v1.35.5+k3s1"   # lab-verified; check releases and update when upgrading
+
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$INSTALL_K3S_VERSION" sh -s - server \
+  --cluster-init \
+  --tls-san <kube-vip> \
+  --tls-san vip.k3s.example.com \
+  --disable traefik \
+  --disable servicelb \
+  --write-kubeconfig-mode 0644
+
+sudo k3s kubectl get nodes
+
+export VIP=<kube-vip>
+export INTERFACE=$(ip -o -4 route show to default | awk '{print $5}')   # = ens18 in this lab
+export KVVERSION=v1.2.0   # pin; the lab standardised on kube-vip v1.2.0
+
+# RBAC for kube-vip (creates the kube-vip ServiceAccount used by --inCluster)
+sudo curl -sL https://kube-vip.io/manifests/rbac.yaml \
+  -o /var/lib/rancher/k3s/server/manifests/kube-vip-rbac.yaml
+
+# Generate the control-plane-ONLY DaemonSet (note: NO --services flag)
+sudo ctr image pull ghcr.io/kube-vip/kube-vip:$KVVERSION
+sudo ctr run --rm --net-host ghcr.io/kube-vip/kube-vip:$KVVERSION vip \
+  /kube-vip manifest daemonset \
+    --interface $INTERFACE \
+    --address $VIP \
+    --inCluster \
+    --controlplane \
+    --arp \
+    --leaderElection \
+  | sudo tee /var/lib/rancher/k3s/server/manifests/kube-vip.yaml
+
+
+# The kube-vip v1.2.0 generator emits no nodeSelector, which means the DaemonSet will schedule onto every node including agents. An agent has no API server — a kube-vip pod there will still participate in the plndr-cp-lock leader election, creating a latent control-plane outage risk. Add the following under spec.template.spec in the generated /var/lib/rancher/k3s/server/manifests/kube-vip.yaml (alongside serviceAccountName: kube-vip):
+
+  nodeSelector:
+    node-role.kubernetes.io/control-plane: "true"
+
+ping -c2 <kube-vip>                     # VIP should now answer
+sudo k3s kubectl -n kube-system get pods | grep kube-vip
+
+sudo cat /var/lib/rancher/k3s/server/node-token
+
+# So the VIP can fail over to them. Copy the same kube-vip.yaml + kube-vip-rbac.yaml you generated in doc 02 into /var/lib/rancher/k3s/server/manifests/ on each new server before installing k3s (or commit them to your repo and template them in via your bootstrap).
+curl -sfL https://get.k3s.io | INSTALL_K3S_VERSION="$INSTALL_K3S_VERSION" \
+  K3S_TOKEN="<node-token>" \
+  sh -s - server \
+    --server "https://<kube-vip>:6443" \
+    --tls-san <kube-vip> \
+    --tls-san k3s-vip.internal.example.com \
+    --disable traefik \
+    --disable servicelb \
+    --write-kubeconfig-mode 0644
+
+kubectl get nodes                       # srv-02 appears as control-plane,etcd,master
+sudo k3s etcd-snapshot ls 2>/dev/null   # sanity that etcd is responsive
+kubectl get pods -n kube-system | grep etcd
+
+# To delete a node..
+kubectl drain <node> --ignore-daemonsets --delete-emptydir-data
+kubectl delete node <node>
+# on the node itself:
+sudo /usr/local/bin/k3s-agent-uninstall.sh    # agent
+# or
+sudo /usr/local/bin/k3s-uninstall.sh          # server (ensure quorum stays odd & healthy first!)
+
+
+# on your workstation
+mkdir -p ~/.kube
+scp k3s01:/etc/rancher/k3s/k3s.yaml ~/.kube/config-k3s-internal
+sed -i 's#https://127.0.0.1:6443#https://<kube-vip>:6443#' ~/.kube/config-k3s-internal
+export KUBECONFIG=~/.kube/config-k3s-internal
+kubectl get nodes
+
+
+
+curl https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+helm repo add metallb https://metallb.github.io/metallb
+helm repo add csi-driver-nfs https://raw.githubusercontent.com/kubernetes-csi/csi-driver-nfs/master/charts
+helm repo add ingress-nginx https://kubernetes.github.io/ingress-nginx
+helm repo add jetstack https://charts.jetstack.io
+helm repo add sealed-secrets https://bitnami.github.io/sealed-secrets
+helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+helm repo add argo https://argoproj.github.io/argo-helm
+helm repo add elastic https://helm.elastic.co
+helm repo update
+
+helm install metallb metallb/metallb \
+  --namespace metallb-system --create-namespace --wait
+
+kubectl -n metallb-system rollout status deploy/metallb-controller
+
+# metallb-config.yaml
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: lan-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    - <metal_lv-range_ips>   # MUST be reserved & excluded from DHCP (doc 01)
+                                  # verify the range is actually free first, e.g.: for i in 240 241 250; do ping -c1 -W1 10.10.10.$i; done
+---
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: lan-pool-l2
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - lan-pool
+
+# apply.. 
+
+helm install csi-driver-nfs csi-driver-nfs/csi-driver-nfs \
+  --namespace kube-system --version 4.13.2 --wait   # 4.13.2 = current at time of writing; check `helm search repo csi-driver-nfs`
+
+# storageclass-nfs.yaml
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: nfs-csi
+provisioner: nfs.csi.k8s.io
+parameters:
+  server: <kube-vip>
+  share: /nfs            # confirm the export name first: showmount -e 10.40.40.220
+reclaimPolicy: Retain        # keep data on PVC delete; safer for a backup target
+volumeBindingMode: Immediate
+mountOptions:
+  - nfsvers=4.1
+  - hard
+
+# apply and..
+kubectl get storageclass
+
+
+helm install ingress-nginx ingress-nginx/ingress-nginx \
+  --namespace ingress-nginx --create-namespace --wait \
+  --set controller.ingressClassResource.default=true \
+  --set controller.service.type=LoadBalancer \
+  --set controller.service.loadBalancerIP=<ingress-ip>   # pin the IP so DNS can rely on it
+
+kubectl -n ingress-nginx get svc ingress-nginx-controller
+# EXTERNAL-IP should show exactly <ingress-ip>
+curl -s -o /dev/null -w '%{http_code}\n' http://<ingress-ip>/   # 404 = nginx default backend answering
+
+
+
+helm install cert-manager jetstack/cert-manager \
+  --namespace cert-manager --create-namespace --wait \
+  --set crds.enabled=true            # verified with chart v1.20.2
+
+helm repo add adcs-issuer https://djkormo.github.io/adcs-issuer/
+helm repo update
+helm install adcs-issuer adcs-issuer/adcs-issuer \
+  --namespace cert-manager --version <current-chart-version> --wait
+
+# adcs-credentials.yaml  (seal this with Sealed Secrets once §6 is installed; plaintext only for bootstrap)
+apiVersion: v1
+kind: Secret
+metadata:
+  name: adcs-credentials
+  namespace: cert-manager
+type: Opaque
+stringData:
+  username: "EXAMPLE\\svc-certmgr"     # service account permitted to enrol
+  password: "REDACTED"
+---
+apiVersion: adcs.certmanager.csf.nokia.com/v1   # API group: confirm against the chart you install
+kind: ClusterAdcsIssuer
+metadata:
+  name: adcs
+spec:
+  url: "https://adcs.internal.example.com"
+  credentialsRef: { name: adcs-credentials }
+  caBundle: <base64 of your root+sub-CA chain PEM>   # trust chain only, NO private key
+  templateName: "WebServer"        # the ADCS certificate template to use
+  statusCheckInterval: "6h"
+  retryInterval: "1h"
+
+
+kubectl -n cert-manager get secret adcs-credential \
+  -o jsonpath='{.data.tls\.crt}' | base64 -d > lab-root-ca.crt
+
+helm install sealed-secrets sealed-secrets/sealed-secrets \
+  --namespace kube-system --wait        # verified with chart 2.18.6 / controller 0.37.0
+
+# On your laptop..
+KSEAL=$(curl -s https://api.github.com/repos/bitnami-labs/sealed-secrets/releases/latest | awk -F'"' '/tag_name/{print substr($4,2)}')
+curl -sL "https://github.com/bitnami-labs/sealed-secrets/releases/download/v${KSEAL}/kubeseal-${KSEAL}-linux-amd64.tar.gz" | tar xz kubeseal
+sudo install kubeseal /usr/local/bin/
+# no sudo on the workstation? install to ~/.local/bin instead (make sure it's on PATH):
+#   install kubeseal ~/.local/bin/
+
+# 1. create a normal secret manifest locally (do NOT commit this)
+kubectl create secret generic app-db -n projecta-prod \
+  --from-literal=password='s3cr3t' --dry-run=client -o yaml > /tmp/app-db.yaml
+
+# 2. seal it (encrypts with the controller's public key)
+#    --controller-name is REQUIRED with the helm install (see gotcha in 6a)
+kubeseal --controller-namespace kube-system --controller-name sealed-secrets \
+  --format yaml < /tmp/app-db.yaml > app-db-sealed.yaml
+
+# 3. commit app-db-sealed.yaml to Git. Argo CD applies it; the controller decrypts
+#    it in-cluster into the real 'app-db' Secret. Pods consume it normally.
+rm /tmp/app-db.yaml
+
+# backup controller key
+kubectl get secret -n kube-system \
+  -l sealedsecrets.bitnami.com/sealed-secrets-key -o yaml > sealed-secrets-key-backup.yaml
+# Store this file securely OUT of Git.
+
+
+
+# monitoring-values.yaml
+grafana:
+  persistence:
+    enabled: true
+    storageClassName: nfs-csi      # Grafana state survives on NFS
+    size: 5Gi
+  ingress:
+    enabled: true
+    ingressClassName: nginx
+    hosts: ["grafana.apps.exmaple.com"]
+    tls:
+      - hosts: ["grafana.apps.example.com"]
+        secretName: grafana-tls
+    annotations:
+      cert-manager.io/cluster-issuer: lab-ca   # auto-TLS from your CA (prod: adcs)
+prometheus:
+  prometheusSpec:
+    retention: 15d
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          storageClassName: nfs-csi
+          accessModes: [ReadWriteOnce]
+          resources: { requests: { storage: 50Gi } }
+
+helm install monitoring prometheus-community/kube-prometheus-stack \
+  --namespace monitoring --create-namespace \
+  -f monitoring-values.yaml --wait      # verified with chart 86.2.2
+
+kubectl -n monitoring get secret monitoring-grafana \
+  -o jsonpath='{.data.admin-password}' | base64 -d; echo
+
+curl --cacert lab-root-ca.crt --resolve grafana.apps.mreja:443:<ingress-ip> \
+  https://grafana.apps.example.com/api/health    # expect {"database":"ok",...}
+
+
+
+helm install argocd argo/argo-cd \
+  --namespace argocd --create-namespace --wait \
+  --set server.ingress.enabled=true \
+  --set server.ingress.ingressClassName=nginx \
+  --set server.ingress.hostname=argocd.apps.example.com \
+  --set server.ingress.tls=true \
+  --set 'server.ingress.annotations.cert-manager\.io/cluster-issuer=lab-ca' \
+  --set 'configs.params.server\.insecure=true'
+# verified with chart 9.5.21 / Argo CD v3.4.3; issuer is 'adcs' in prod
+
+kubectl -n argocd get secret argocd-initial-admin-secret \
+  -o jsonpath='{.data.password}' | base64 -d; echo
+
+argocd login argocd.apps.example.com      # requires the 
+argocd repo add http://<gitlab>/path/to/repo \
+  --username test --password <gitlab-access-token> \
+  -- core # do i I need this?
+
+
+kubectl get pods -A | grep -Ev 'Running|Completed'   # should print nothing
+kubectl get svc -A | grep LoadBalancer                # ingress-nginx (+ later ES) have pool IPs
+kubectl get storageclass                              # local-path (default) + nfs-csi
+kubectl get clusterissuer                             # lab-ca Ready=True (prod: adcs)
+argocd app list                                       # empty for now; populated in doc 06 (no DNS yet? add --core)
+
+
+
+argocd repocreds add http://<gitlab>/parent-group/ \
+  --username test --password <token> (--core??)
+
+argocd repocreds list (--core ??)
+
+# bootstrap..
+
+# bootstrap/root-app.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://gitlab.internal.example.com/infra/gitops.git
+    targetRevision: main
+    path: cluster
+    repoURL: https://gitlab.internal.example.com/infra/gitops.git
+    targetRevision: main
+    path: services
+  destination:
+    server: https://kubernetes.default.svc
+  syncPolicy:
+    automated: { prune: true, selfHeal: true }
+
+# apply..
+
+The doc 03 components were installed by hand with helm/kubectl, so the first sync must adopt them without churn. The verified-safe procedure:
+
+    Write the Application with syncPolicy: {} (no automation). On creation it reports OutOfSync / Healthy — it sees the live objects but won't touch them.
+    argocd app diff <name> --core — confirm the only diff is Argo CD adding its argocd.argoproj.io/tracking-id annotations (no spec changes, no replacements). For MetalLB/ES this was exactly the case; nothing restarted.
+    argocd app sync <name> --core once, then verify pods/LB IPs/ES health unchanged.
+    Only then commit syncPolicy.automated: { prune: true, selfHeal: true } and push; root-platform rolls the automation out. (MetalLB chart sync used syncOptions: [ServerSideApply=true] to avoid the last-applied-annotation size limit on the CRDs.)
+
+The MetalLB pool CRs need the controller's webhook up first (doc 03 §2). Use Argo CD sync-waves so the controller installs before the pool:
+
+# platform/metallb/application.yaml  (the chart) — wave 0
+metadata:
+  annotations: { argocd.argoproj.io/sync-wave: "0" }
+
+# platform/metallb/pool.yaml (IPAddressPool + L2Advertisement) — wave 1
+metadata:
+  annotations: { argocd.argoproj.io/sync-wave: "1" }
+
+Container Registry — enabled on the GitLab instance (GitLab 19.0.2 EE) and on the projecta project. Endpoint is <gitlab>:5050 over plain HTTP. Probe it with curl -I http://<gitlab>:5050/v2/ (expect 401 = registry alive).
+A GitLab Runner — installed on the GitLab server itself (apt install gitlab-runner, Ubuntu 24.04), docker executor, gitlab-runner user added to the docker group. GitLab 19 removed the registration-token flow: create the runner in the UI (project → Settings → CI/CD → Runners → New project runner, tick "Run untagged jobs") to mint a glrt-… authentication token, then gitlab-runner register --non-interactive --url http://10.40.40.230 --token glrt-… --executor docker --docker-image alpine:latest.
+Node trust for the HTTP registry — containerd refuses plain-HTTP registries by default. On every node, write /etc/rancher/k3s/registries.yaml:
+
+mirrors:
+  "<gitlab>:5050":
+    endpoint:
+      - "http://<gitlab>:5050"
+configs:
+  "<gitlab>:5050":
+    tls:
+      insecure_skip_verify: true
+
+then restart k3s (systemctl restart k3s on the server, k3s-agent on agents) — it re-renders certs.d/1<gitlab>:5050/hosts.toml. The restart is rolling and the control-plane VIP rides through it. (Agent nodes may not have /etc/rancher/k3s/ yet — mkdir -p first.)
+
+
+# .gitlab-ci.yml
+stages: [build, deploy]
+
+.build_template: &build
+  stage: build
+  image: gcr.io/kaniko-project/executor:debug   # rootless image build, no docker daemon
+  script:
+    - /kaniko/executor
+        --context "$CI_PROJECT_DIR"
+        --dockerfile "$CI_PROJECT_DIR/Dockerfile"
+        --destination "$CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA"
+  # $CI_REGISTRY, $CI_REGISTRY_IMAGE, and auth via $CI_JOB_TOKEN are injected by GitLab.
+  # The job token is EPHEMERAL and scoped to this job — not a long-lived credential.
+
+build-projecta:
+  <<: *build
+  variables: { APP: projecta }
+  rules:
+    - changes: [ "projecta/**/*" ]
+
+build-projectb:
+  <<: *build
+  variables: { APP: projectb }
+  rules:
+    - changes: [ "projectb/**/*" ]
+
+deploy-staging:
+  stage: deploy
+  image:
+    name: alpine/git
+    entrypoint: [""]          # alpine/git's ENTRYPOINT is `git`; clear it or the
+                              # job runs `git sh -c …` → "git: 'sh' is not a git command"
+  variables:
+    GIT_STRATEGY: none        # we only touch the GitOps/tags repo, not this checkout
+  script:
+    # One block scalar: colons/quotes inside stay literal, so a commit message like
+    # "projecta: staging" can't be misparsed as a YAML mapping (see GOTCHA below).
+    - |
+      set -e
+      git config --global user.email "ci@$APP"
+      git config --global user.name "$APP CI"
+      git clone https://oauth2:${GITOPS_WRITE_TOKEN}@gitlab.internal.example.com/infra/gitops.git
+      cd gitops/source/$APP/staging
+      yq -i '.image.tag = "'"$CI_COMMIT_SHORT_SHA"'"' image-tag.yaml
+      git commit -am "$APP: staging -> $CI_COMMIT_SHORT_SHA [skip ci]"
+      git push
+  # Argo CD sees the commit and deploys to projecta-staging automatically.
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "main"'
+
+kubectl create secret docker-registry gitlab-pull     --docker-server=<gitlab>:5050     --docker-username=     --docker-password=     --dry-run=client -o yaml   | kubeseal --controller-name sealed-secrets --controller-namespace kube-system       --scope cluster-wide --format yaml > source/pull-secret-sealed.yaml
+
+Commit the sealed version. Reference it in your Deployment/Helm values.
+
+
+helm install elastic-operator elastic/eck-operator --version 3.4.0 \
+  --namespace elastic-system --create-namespace --wait
+
+kubectl -n elastic-system get pods
+kubectl -n elastic-system logs statefulset/elastic-operator | tail
+
+# es-http-cert.yaml
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: es-http-cert
+  namespace: elastic-system
+spec:
+  secretName: es-http-cert            # ECK consumes this via spec.http.tls.certificate
+  dnsNames:
+    - elasticsearch.apps.mreja        # external hostname (lab: no live DNS)
+    # In-cluster service names: REQUIRED when replacing ECK's self-signed cert,
+    # or in-cluster clients (e.g. Prometheus exporter) fail TLS verification.
+    - logging-es-http
+    - logging-es-http.elastic-system.svc
+    - logging-es-http.elastic-system.svc.cluster.local
+  ipAddresses:
+    - <es-metallb_ip>                    # ES MetalLB IP Logstash connects to
+  issuerRef:
+    name: adcs                        # prod: ADCS; lab: use lab-ca instead
+    kind: ClusterAdcsIssuer           # prod: ClusterAdcsIssuer; lab: ClusterIssuer
+
+kubectl apply -f es-http-cert.yaml
+kubectl -n elastic-system describe certificate es-http-cert   # Ready: True
+
+
+# elasticsearch.yaml
+apiVersion: elasticsearch.k8s.elastic.co/v1
+kind: Elasticsearch
+metadata:
+  name: logging
+  namespace: elastic-system
+spec:
+  version: 8.19.9
+  http:
+    tls:
+      certificate:
+        secretName: es-http-cert      # lab-ca-issued cert from step 3
+  nodeSets:
+    - name: data
+      count: 3                         # scale this number to add ES nodes (see step 7)
+      config:
+        node.roles: ["master", "data", "ingest"]
+        path.repo: ["/usr/share/elasticsearch/snapshots"]   # REQUIRED for fs snapshot repo
+        node.attr.k8s_host: "${NODE_NAME}"
+        cluster.routing.allocation.awareness.attributes: k8s_host
+      podTemplate:
+        spec:
+          containers:
+            - name: elasticsearch
+              resources:
+                requests: { memory: 4Gi, cpu: "1" }
+                limits:   { memory: 4Gi, cpu: "2" }
+              env:
+                - name: ES_JAVA_OPTS
+                  value: "-Xms2g -Xmx2g"   # ~50% of container memory
+              volumeMounts:
+                - name: es-snapshots
+                  mountPath: /usr/share/elasticsearch/snapshots
+          volumes:
+            - name: es-snapshots
+              persistentVolumeClaim:
+                claimName: es-snapshots
+      volumeClaimTemplates:
+        - metadata:
+            name: elasticsearch-data
+          spec:
+            accessModes: [ReadWriteOnce]
+            storageClassName: local-path
+            resources:
+              requests:
+                storage: 10Gi
+
+kubectl apply -f elasticsearch.yaml
+kubectl -n elastic-system get elasticsearch logging   # watch HEALTH -> green
+kubectl -n elastic-system get pods -l elasticsearch.k8s.elastic.co/cluster-name=logging
+
+kubectl -n elastic-system get secret logging-es-elastic-user \
+  -o jsonpath='{.data.elastic}' | base64 -d; echo
+
+# es-loadbalancer.yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: logging-es-lb
+  namespace: elastic-system
+  annotations:
+    metallb.universe.tf/loadBalancerIPs: <es-metallb-ip>   # stable IP for Logstash
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local        # preserve client source IP
+  selector:
+    elasticsearch.k8s.elastic.co/cluster-name: logging
+  ports:
+    - name: https
+      port: 9200
+      targetPort: 9200
+
+kubectl apply -f es-loadbalancer.yaml
+kubectl -n elastic-system get svc logging-es-lb   # EXTERNAL-IP = <es-metallb-ip>
+
+# es-snapshot-pvc.yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata: { name: es-snapshots, namespace: elastic-system }
+spec:
+  accessModes: [ReadWriteMany]      # RWX so all ES nodes share the repo
+  storageClassName: nfs-csi
+  resources: { requests: { storage: 50Gi } }
+
+kubectl apply -f es-snapshot-pvc.yaml
+
+
+# via the ES API (using the elastic user)
+PUT _snapshot/nfs_repo
+{ "type": "fs", "settings": { "location": "/usr/share/elasticsearch/snapshots", "compress": true } }
+
+# Verify the repository
+POST _snapshot/nfs_repo/_verify
+
+# Snapshot Lifecycle Management: daily, incremental, retained 30 days
+PUT _slm/policy/daily
+{
+  "schedule": "0 30 1 * * ?",
+  "name": "<daily-{now/d}>",
+  "repository": "nfs_repo",
+  "config": { "indices": ["*"] },
+  "retention": { "expire_after": "30d" }
+}
+
+
+helm install es-exporter prometheus-community/prometheus-elasticsearch-exporter \
+  --version 7.2.1 -n elastic-system -f es-exporter-values.yaml
+
+# es-exporter-values.yaml
+es:
+  uri: https://logging-es-http.elastic-system.svc:9200
+  ssl:
+    enabled: true
+    useExistingSecrets: true
+    ca:
+      path: /ssl/ca.crt              # ca.crt from the cert-manager es-http-cert secret
+    client:
+      enabled: false                 # basic auth, no mTLS
+secretMounts:
+  - name: es-ca
+    secretName: es-http-cert
+    path: /ssl
+env:
+  ES_USERNAME: elastic
+extraEnvSecrets:
+  ES_PASSWORD:
+    secret: logging-es-elastic-user
+    key: elastic
+serviceMonitor:
+  enabled: true
+  labels:
+    release: monitoring              # kube-prometheus-stack only selects this label
+
+
+kubectl -n elastic-system get pod -l app.kubernetes.io/name=prometheus-elasticsearch-exporter
+# Check Prometheus UI -> Targets -> "elasticsearch" should be Up
+
+
+
+./
+├── ./cluster                      # This is where all the components that make our cluster live (ingress, certmanager, etc)
+│   ├── ./cluster/argocd
+│   ├── ./cluster/cert-manager
+│   ├── ./cluster/ingress-nginx
+│   ├── ./cluster/kube-prometheus-stack
+│   ├── ./cluster/metallb
+│   └── ./cluster/sealed-secrets
+├── ./README.md
+├── ./services                     # This is for all the rest deployments and their manifests
+│   └── ./services/elasticsearch
+└── ./source                       # This is where source for custom built apps lives - Dockerfile, code, etc
+    └── ./source/projecttemplate   # Example project you can reference when deploying your own app
+
++ ./bootstrap/bootstrap.yml
