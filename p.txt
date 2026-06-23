@@ -672,7 +672,8 @@ kubectl -n elastic-system get pod -l app.kubernetes.io/name=prometheus-elasticse
   helm repo add djkormo-adcs-issuer https://djkormo.github.io/adcs-issuer/ && helm repo update
   helm show values djkormo-adcs-issuer/adcs-issuer | grep -iA2 'simulator\|example'   # confirm any sim/example toggle is false
   helm install adcs-issuer djkormo-adcs-issuer/adcs-issuer \
-    --namespace cert-manager
+    --namespace cert-manager \
+    --set exampleCertificate.enabled=false
 
   Gate: kubectl get pods -n cert-manager | grep adcs → adcs-issuer-controller-manager Running 1/1.
 
