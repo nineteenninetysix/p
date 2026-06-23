@@ -638,3 +638,128 @@ kubectl -n elastic-system get pod -l app.kubernetes.io/name=prometheus-elasticse
     └── ./source/projecttemplate   # Example project you can reference when deploying your own app
 
 + ./bootstrap/bootstrap.yml
+
+
+
+  helm list -A | grep -Ei 'cert-manager|adcs'
+
+  # uninstall both releases (adjust namespace if helm list showed something else)
+  helm uninstall adcs-issuer  -n cert-manager
+  helm uninstall cert-manager -n cert-manager
+
+  # remove the stray cluster-scoped issuer/CRD leftovers (the demo + cert-manager CRDs)
+  kubectl delete clusteradcsissuer --all 2>/dev/null
+  kubectl delete namespace cert-manager
+
+  # cert-manager CRDs survive a helm uninstall — clear them for a truly fresh start
+  kubectl get crd | grep -E 'cert-manager|adcs' | awk '{print $1}' | xargs -r kubectl delete crd
+
+  If the namespace hangs in Terminating, it's a stuck finalizer on a leftover cert — kubectl get certificate,certificaterequest -n cert-manager and delete them.
+
+  Step 1 — Install cert-manager (with its CRDs)
+
+  helm repo add jetstack https://charts.jetstack.io && helm repo update
+  helm install cert-manager jetstack/cert-manager \
+    --namespace cert-manager --create-namespace \
+    --set crds.enabled=true
+
+  Gate: kubectl get pods -n cert-manager → all 3 (cert-manager, cainjector, webhook) Running.
+
+  Step 2 — Install the ADCS issuer (no simulator)
+
+  Your earlier adcs-sim-* objects came from the demo/simulator. Check the values and make sure it's off before installing:
+
+  helm repo add djkormo-adcs-issuer https://djkormo.github.io/adcs-issuer/ && helm repo update
+  helm show values djkormo-adcs-issuer/adcs-issuer | grep -iA2 'simulator\|example'   # confirm any sim/example toggle is false
+  helm install adcs-issuer djkormo-adcs-issuer/adcs-issuer \
+    --namespace cert-manager
+
+  Gate: kubectl get pods -n cert-manager | grep adcs → adcs-issuer-controller-manager Running 1/1.
+
+  Now find the namespace the controller expects cluster-issuer secrets in — this is the #1 gotcha for a ClusterAdcsIssuer:
+
+  kubectl get deploy adcs-issuer-controller-manager -n cert-manager -o yaml | grep -i cluster-resource-namespace
+
+  Whatever that prints (call it $CRN — often adcs-issuer, but it depends on how the chart was installed) is where the credentials Secret must live. For a ClusterAdcsIssuer, the secret is NOT looked up next to your Certificate — it's
+  looked up in $CRN. Use that namespace in Step 3.
+
+  Step 3 — Credentials Secret (in $CRN from above)
+
+  The secret must be Opaque with exactly username and password keys. Username is the NTLM account in DOMAIN\user form:
+
+  kubectl create secret generic adcs-issuer-credentials \
+    -n <CRN-from-step-2> \
+    --from-literal=username='YOURDOMAIN\svc-certmgr' \
+    --from-literal=password='YOUR-PASSWORD'
+
+  Step 4 — Encode your CA bundle
+
+  caBundle is the base64 of the CA chain (PEM) that signed your ADCS web-enrolment endpoint's HTTPS cert — so the issuer can trust the TLS connection to /certsrv. Usually your internal root + issuing CA concatenated:
+
+  base64 -w0 ca-chain.pem    # copy this single-line output into caBundle below
+
+  Step 5 — Create the ClusterAdcsIssuer
+
+  # adcs-issuer.yaml
+  apiVersion: adcs.certmanager.csf.nokia.com/v1
+  kind: ClusterAdcsIssuer
+  metadata:
+    name: adcs
+  spec:
+    url: https://adcs.yourdomain.internal/certsrv   # ADCS web-enrolment endpoint (note /certsrv)
+    templateName: WebServer                          # YOUR template name exactly
+    caBundle: <paste base64 from step 4>
+    credentialsRef:
+      name: adcs-issuer-credentials                  # found in $CRN automatically
+    statusCheckInterval: 6h
+    retryInterval: 1h
+
+  kubectl apply -f adcs-issuer.yaml
+
+  Gate — this is the step you skipped before:
+  kubectl get clusteradcsissuer adcs            # must actually appear now
+  kubectl describe clusteradcsissuer adcs       # look for Ready/processing, no auth or secret-not-found errors
+  If it complains it can't find the secret → the secret is in the wrong namespace (re-check $CRN). If it errors on auth/TLS → username format or caBundle is wrong. Fix this before issuing any cert.
+
+  Step 6 — Test Certificate (note the group!)
+
+  This is the field that was missing in our docs and causes "cannot find issuer" — for an external issuer issuerRef.group is mandatory:
+
+  # test-cert.yaml
+  apiVersion: cert-manager.io/v1
+  kind: Certificate
+  metadata:
+    name: adcs-test
+    namespace: default
+  spec:
+    secretName: adcs-test-tls
+    commonName: adcs-test.yourdomain.internal
+    dnsNames: ["adcs-test.yourdomain.internal"]
+    issuerRef:
+      name: adcs
+      kind: ClusterAdcsIssuer
+      group: adcs.certmanager.csf.nokia.com    # ← REQUIRED for the external issuer
+
+  kubectl apply -f test-cert.yaml
+  kubectl get certificate,certificaterequest,adcsrequest -n default
+  kubectl describe certificate adcs-test -n default     # Ready: True
+  kubectl logs -n cert-manager deploy/adcs-issuer-controller-manager --tail=30
+
+  - "Couldn't get issuer ... not found" → group/name/kind mismatch (recheck Step 6) or issuer not Ready (back to Step 5).
+  - "Processing ADCS request, Pending" that never clears → issuer resolved fine; now it's an ADCS-side problem (template name, the service account's enrol permission on that template, or NTLM auth). The controller logs will name it.
+
+  Step 7 — Using it from Ingress
+
+  For an external issuer the bare cert-manager.io/cluster-issuer annotation isn't enough; you must also give the group and kind:
+
+  annotations:
+    cert-manager.io/cluster-issuer: adcs
+    cert-manager.io/issuer-kind:  ClusterAdcsIssuer
+    cert-manager.io/issuer-group: adcs.certmanager.csf.nokia.com
+
+  ---
+  Two notes on our docs (03-cluster-components.md), which are genuinely wrong/incomplete for the prod ADCS path and contributed to this:
+  1. §5c test cert and the Grafana Ingress annotation omit issuerRef.group / issuer-group — they only work for the lab's lab-ca (which lives in the default cert-manager.io group).
+  2. They never state the credentials-Secret-must-live-in-cluster-resource-namespace rule for a ClusterAdcsIssuer.
+
+  Want me to fold those corrections into doc 03 (clearly labelled as prod-path, since the lab itself runs Path B and I can't verify ADCS against the lab)? I'd route it through the doc-amender.
