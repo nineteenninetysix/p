@@ -765,3 +765,128 @@ kubectl -n elastic-system get pod -l app.kubernetes.io/name=prometheus-elasticse
   2. They never state the credentials-Secret-must-live-in-cluster-resource-namespace rule for a ClusterAdcsIssuer.
 
   Want me to fold those corrections into doc 03 (clearly labelled as prod-path, since the lab itself runs Path B and I can't verify ADCS against the lab)? I'd route it through the doc-amender.
+
+
+
+
+  monitoring-values.yaml
+
+  # kube-prometheus-stack on NFS-over-TLS storage with root_squash.
+  # Pairs with the nfs-csi StorageClass below (mountPermissions: "0777").
+  # The two root_squash gotchas handled here:
+  #   - grafana init-chown-data chown fails under root_squash  -> disabled
+  #   - fsGroup chown also fails under root_squash             -> 0777 subdir (on the SC) makes it moot
+
+  fullnameOverride: monitoring
+
+  # ----------------------------- Grafana -----------------------------
+  grafana:
+    # root chown can never succeed on a root_squash export; the 0777 subdir
+    # from the StorageClass makes it unnecessary anyway.
+    initChownData:
+      enabled: false
+    persistence:
+      enabled: true
+      type: pvc
+      storageClassName: nfs-csi
+      accessModes: ["ReadWriteOnce"]
+      size: 10Gi
+    adminPassword: "changeme"        # replace, or point at an existing secret
+    # ingress:                       # uncomment + fill if you want external access
+    #   enabled: true
+    #   ingressClassName: nginx
+    #   annotations:
+    #     cert-manager.io/cluster-issuer: lab-ca
+    #   hosts: ["grafana.apps.mreja"]
+    #   tls:
+    #     - secretName: grafana-tls
+    #       hosts: ["grafana.apps.mreja"]
+
+  # --------------------------- Prometheus ----------------------------
+  prometheus:
+    prometheusSpec:
+      retention: 15d
+      # pick up ServiceMonitors/PodMonitors/Rules created outside this chart
+      serviceMonitorSelectorNilUsesHelmValues: false
+      podMonitorSelectorNilUsesHelmValues: false
+      ruleSelectorNilUsesHelmValues: false
+      probeSelectorNilUsesHelmValues: false
+      storageSpec:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: nfs-csi
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 50Gi
+
+  # -------------------------- Alertmanager ---------------------------
+  alertmanager:
+    alertmanagerSpec:
+      storage:
+        volumeClaimTemplate:
+          spec:
+            storageClassName: nfs-csi
+            accessModes: ["ReadWriteOnce"]
+            resources:
+              requests:
+                storage: 5Gi
+
+  nfs-csi-storageclass.yaml (the 0777 + TLS bits Helm can't carry)
+
+  apiVersion: storage.k8s.io/v1
+  kind: StorageClass
+  metadata:
+    name: nfs-csi
+  provisioner: nfs.csi.k8s.io
+  parameters:
+    server: <nfs-fqdn>          # the FQDN in the server cert SAN — NOT an IP
+    share: <export-path>        # your real exportfs path
+    mountPermissions: "0777"    # world-writable per-PV subdir -> writable under root_squash
+  reclaimPolicy: Retain         # Retain keeps data if a PVC is deleted; use Delete if you prefer
+  volumeBindingMode: Immediate
+  allowVolumeExpansion: true
+  mountOptions:
+    - nfsvers=4.1
+    - hard
+    - xprtsec=tls               # enforce TLS on the client mount
+
+  Install from scratch
+
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  helm repo update
+
+  # 1) StorageClass (cluster-scoped; apply once, before the chart)
+  kubectl apply -f nfs-csi-storageclass.yaml
+
+  # 2) The stack — pin the chart version for reproducibility
+  helm install monitoring prometheus-community/kube-prometheus-stack \
+    --namespace monitoring --create-namespace \
+    --version <chart-version> \
+    -f monitoring-values.yaml
+
+  To redeploy cleanly later:
+  helm uninstall monitoring -n monitoring
+  kubectl delete namespace monitoring        # clears leftover PVCs
+  # (PVs/data: kept if reclaimPolicy=Retain — delete the released PVs/dirs manually if you want a truly fresh start)
+  kubectl apply -f nfs-csi-storageclass.yaml # if you also deleted the SC
+  helm install monitoring ... -f monitoring-values.yaml
+
+  The 4 things that live outside this YAML (your "no adjust after" depends on them)
+
+  These are node/server/cluster state, not chart values — have them in place before installing:
+
+  1. StorageClass mountPermissions: "0777" — in the SC file above (can't go in Helm values). This is what actually makes the volume writable under root_squash.
+  2. NFS server export = ... sec=sys,xprtsec=tls,root_squash and exportfs -ra. (xprtsec=tls enforces TLS; root_squash is why we need 0777.)
+  3. tlshd running on every node + each node trusts the server's CA, and the cert SAN covers the FQDN in the StorageClass server. New nodes need this too — bake it into OS-prep so doc-05 node adds don't silently break.
+  4. Kernel ≥ 6.5 on all nodes (for xprtsec client support).
+
+  Verify green
+
+  kubectl -n monitoring get pods                 # all Running, no Init:/CrashLoop
+  kubectl -n monitoring get pvc                   # all Bound
+  grep -i nfs /proc/mounts | grep xprtsec         # mounts show xprtsec=tls on the node
+
+  One judgment call I made for you: I set *SelectorNilUsesHelmValues: false so Prometheus scrapes ServiceMonitors created outside this release (otherwise it only sees its own) — drop those four lines if you want it scoped strictly to the
+  chart. Everything else is the minimum to come up clean on TLS-NFS with root_squash. Once it's up, I can hand the two root_squash fixes and the xprtsec=tls SC change to the doc-amender for doc 03.
+
